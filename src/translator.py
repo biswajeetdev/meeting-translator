@@ -100,25 +100,82 @@ def clean(line: str) -> str:
     return line
 
 
-def is_repeat(text: str, seen: deque) -> bool:
-    """True if this line is something we have already sent to the translator.
+SENTENCE_END = tuple(".!?…。！？")
 
-    In VAD mode whisper-stream re-transcribes a growing buffer, so the same
-    sentence arrives again every couple of seconds until the pause that flushes
-    it. Without this, one sentence is translated -- and billed, and shown -- four
-    times over. Silence also produces a stuck hallucination ("Thank you.",
-    "*sighs*") that repeats until someone speaks; the same check absorbs it.
 
-    Exact repeats only. A growing buffer can also re-emit the previous sentence
-    with more words appended, but suppressing those would drop the tail of what
-    someone actually said, and that behaviour has not been characterised against
-    real speech yet -- so the fuller line is allowed through rather than guessed at.
+class LocalAgreement:
+    """Commit only the words two successive passes agree on.
+
+    In VAD mode whisper-stream re-transcribes a *growing* buffer, so the same
+    sentence arrives again every couple of seconds, each time a little longer,
+    until the pause that flushes it. Dropping exact repeats (what this used to do)
+    handles the stuck-hallucination case but not the growing one: "Buenos días"
+    then "Buenos días a todos" are different strings, so both went through and the
+    opening got translated twice.
+
+    LocalAgreement is the standard fix, from Whisper-Streaming (Machácek et al.,
+    2023) and used by WhisperLiveKit. A word is only emitted once two consecutive
+    hypotheses put it in the same position. The newest, least certain tail is held
+    back until the next pass confirms it, so output is append-only: nothing already
+    shown is ever retracted or repeated.
+
+    It absorbs the silence hallucination for free — ten identical "Thank you."
+    passes agree, commit once, and then have nothing left to add.
     """
-    norm = " ".join(text.lower().split())
-    if norm in seen:
-        return True
-    seen.append(norm)
-    return False
+
+    def __init__(self) -> None:
+        self.committed: "list[str]" = []
+        self.prev: "list[str]" = []
+
+    def reset(self) -> None:
+        self.committed = []
+        self.prev = []
+
+    def insert(self, text: str) -> "list[str]":
+        """Feed one hypothesis; get back only the words newly agreed upon."""
+        words = text.split()
+        # If the new hypothesis no longer starts with what we already emitted, the
+        # decoder flushed its buffer and this is a different utterance.
+        if words[:len(self.committed)] != self.committed:
+            self.reset()
+        i = len(self.committed)
+        fresh: "list[str]" = []
+        while i < len(words) and i < len(self.prev) and words[i] == self.prev[i]:
+            fresh.append(words[i])
+            i += 1
+        self.committed = words[:i]
+        self.prev = words
+        return fresh
+
+
+class Utterances:
+    """Turn agreed words into whole sentences worth translating.
+
+    LocalAgreement commits a few words at a time. Translating two-word fragments
+    produces nonsense and burns a call each, so words accumulate here and flush on
+    a sentence ending, on a buffer reset, or when the sentence runs too long to
+    keep waiting.
+    """
+
+    def __init__(self, max_words: int = 28) -> None:
+        self.pending: "list[str]" = []
+        self.max_words = max_words
+
+    def add(self, words: "list[str]") -> "list[str]":
+        out = []
+        for w in words:
+            self.pending.append(w)
+            if w.endswith(SENTENCE_END) or len(self.pending) >= self.max_words:
+                out.append(" ".join(self.pending))
+                self.pending = []
+        return out
+
+    def flush(self) -> "list[str]":
+        if not self.pending:
+            return []
+        out = [" ".join(self.pending)]
+        self.pending = []
+        return out
 
 
 def parse_reply(raw: str, fallback: str) -> "tuple[str, str | None]":
@@ -470,12 +527,26 @@ def main() -> int:
     threading.Thread(target=worker, args=(jobs, args, key, log_path, speech), daemon=True).start()
 
     idx = 0
-    seen: deque = deque(maxlen=40)
+    agree = LocalAgreement()
+    utter = Utterances()
     for raw in sys.stdin:
         text = clean(raw)
-        if text and not is_repeat(text, seen):
+        if not text:
+            continue
+        was = len(agree.committed)
+        fresh = agree.insert(text)
+        # A reset means the previous utterance ended; send whatever was still held.
+        if len(agree.committed) < was:
+            for sentence in utter.flush():
+                idx += 1
+                jobs.put((idx, sentence))
+        for sentence in utter.add(fresh):
             idx += 1
-            jobs.put((idx, text))
+            jobs.put((idx, sentence))
+
+    for sentence in utter.flush():
+        idx += 1
+        jobs.put((idx, sentence))
 
     jobs.join()  # finish translating what was already said before exiting
     print(f">> {idx} utterances -> {log_path}", file=sys.stderr)

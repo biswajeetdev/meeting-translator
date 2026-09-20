@@ -85,6 +85,17 @@ that looks exactly like an auth failure and is not. Send a real UA.
 utterances whenever one call outruns another, and a meeting transcript in the
 wrong order is worse than a slow one.
 
+**A growing buffer is not a repeated one.** In VAD mode whisper-stream
+re-transcribes its whole buffer each pass, so a sentence arrives again every
+couple of seconds, each time longer. Filtering exact repeats catches the silence
+hallucination but not this: "Buenos días" and "Buenos días a todos" are different
+strings, so the opening got translated twice. The fix is
+[LocalAgreement](https://github.com/ufal/whisper_streaming) — emit a word only
+once two consecutive passes agree on its position, and the output becomes
+append-only. Words are then gathered into whole sentences before translation,
+because translating two-word fragments costs a call each and reads as nonsense.
+See [docs/UPSTREAM.md](docs/UPSTREAM.md).
+
 **The audio device is always restored.** On Ctrl-C, on crash, on a closed
 terminal. Leaving a Mac's output pointed at a loopback device means the next call
 you take is silent and you do not know why.
