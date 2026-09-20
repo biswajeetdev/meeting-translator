@@ -174,6 +174,100 @@ def translate(text: str, context: "deque", args, key: str) -> "tuple[str, str | 
     return parse_reply(data["choices"][0]["message"]["content"], text)
 
 
+# Target language -> locale codes to look for in `say -v '?'`. Only the ones
+# worth guessing; anything else is handled by passing --voice explicitly.
+VOICE_LOCALES = {
+    "english": ("en_US", "en_GB"), "indonesian": ("id_ID",), "spanish": ("es_MX", "es_ES"),
+    "french": ("fr_FR", "fr_CA"), "german": ("de_DE",), "italian": ("it_IT",),
+    "portuguese": ("pt_BR", "pt_PT"), "dutch": ("nl_NL",), "japanese": ("ja_JP",),
+    "korean": ("ko_KR",), "chinese": ("zh_CN", "zh_TW"), "mandarin": ("zh_CN",),
+    "hindi": ("hi_IN",), "arabic": ("ar_001", "ar_SA"), "russian": ("ru_RU",),
+    "turkish": ("tr_TR",), "thai": ("th_TH",), "vietnamese": ("vi_VN",),
+    "polish": ("pl_PL",), "swedish": ("sv_SE",), "malay": ("ms_MY",),
+}
+
+# macOS ships novelty voices (Albert, Bad News, Bubbles, Boing) that sort ahead of
+# the usable ones alphabetically, so scanning by locale alone hands you a cartoon
+# reading your meeting. These are the natural-sounding default per locale.
+PREFERRED = {
+    "en_US": "Samantha", "en_GB": "Daniel", "id_ID": "Damayanti", "es_MX": "Paulina",
+    "es_ES": "Monica", "fr_FR": "Thomas", "de_DE": "Anna", "it_IT": "Alice",
+    "pt_BR": "Luciana", "nl_NL": "Xander", "ja_JP": "Kyoko", "ko_KR": "Yuna",
+    "zh_CN": "Tingting", "hi_IN": "Lekha", "ru_RU": "Milena",
+}
+
+# "Eddy (Spanish (Spain))   es_ES    # ..." -- the name carries nested parentheses,
+# so the locale column is the only reliable anchor.
+VOICE_LINE = re.compile(r"^(?P<name>.+?)\s+(?P<loc>[a-z]{2}[-_][A-Z0-9]{2,3})\s+#")
+
+
+def resolve_voice(target: str) -> "str | None":
+    """Find a macOS voice that actually speaks the target language.
+
+    Saying Indonesian text with an English voice produces confident gibberish, so
+    a missing voice is reported rather than silently substituted. The full voice
+    name matters: several voices exist once per locale ("Eddy (Japanese (Japan))"),
+    and passing the bare "Eddy" gets you whichever one sorts first -- English.
+    """
+    locales = VOICE_LOCALES.get(target.strip().lower())
+    if not locales:
+        return None
+    try:
+        listing = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+
+    by_locale: "dict[str, list[str]]" = {}
+    for line in listing.splitlines():
+        m = VOICE_LINE.match(line)
+        if m:
+            by_locale.setdefault(m.group("loc").replace("-", "_"), []).append(m.group("name").strip())
+
+    for loc in locales:
+        names = by_locale.get(loc)
+        if not names:
+            continue
+        want = PREFERRED.get(loc)
+        if want and want in names:
+            return want
+        # Otherwise prefer a voice dedicated to this locale (a plain name) over a
+        # multi-locale one, whose parenthesised form is longer and less predictable.
+        return sorted(names, key=lambda n: ("(" in n, len(n)))[0]
+    return None
+
+
+def speak_worker(q: "queue.Queue", args) -> None:
+    """Speak translations aloud, skipping any that the meeting has outrun.
+
+    Synthesis happens in real time, so a busy meeting queues faster than it can
+    be spoken. An interpreter who is ninety seconds behind is worse than one who
+    misses a line, so anything older than --speak-lag is dropped rather than
+    played late.
+    """
+    while True:
+        item = q.get()
+        if item is None:
+            return
+        when, text = item
+        if time.time() - when > args.speak_lag:
+            continue
+        cmd = ["say"]
+        if args.voice:
+            cmd += ["-v", args.voice]
+        if args.speak_device:
+            # Target the speakers directly. The system output is a Multi-Output
+            # device feeding BlackHole, so speaking through it would put our own
+            # voice back into the transcriber and translate it forever.
+            cmd += ["-a", args.speak_device]
+        if args.speak_rate:
+            cmd += ["-r", str(args.speak_rate)]
+        cmd.append(text)
+        try:
+            subprocess.run(cmd, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
 def publish(segment: dict) -> None:
     with LOCK:
         STATE["segments"].append(segment)
@@ -187,7 +281,7 @@ def publish(segment: dict) -> None:
             SUBSCRIBERS.remove(q)
 
 
-def worker(jobs: "queue.Queue", args, key, log_path: Path) -> None:
+def worker(jobs: "queue.Queue", args, key, log_path: Path, speech: "queue.Queue | None") -> None:
     context: deque = deque(maxlen=args.context)
     while True:
         item = jobs.get()
@@ -213,6 +307,8 @@ def worker(jobs: "queue.Queue", args, key, log_path: Path) -> None:
             "error": err,
         }
         publish(seg)
+        if speech is not None and not err:
+            speech.put((time.time(), text))
         with log_path.open("a") as fh:
             fh.write(json.dumps(seg, ensure_ascii=False) + "\n")
         marker = "!" if err else ">"
@@ -312,10 +408,21 @@ def main() -> int:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--log", default="", help="JSONL transcript path")
     p.add_argument("--no-window", action="store_true", help="do not open the teleprompter window")
+    p.add_argument("--speak", action="store_true", help="also speak the translation aloud")
+    p.add_argument("--voice", default="", help="macOS voice (default: picked from --target)")
+    p.add_argument("--speak-device", default=os.environ.get("SPEAK_DEVICE", ""),
+                   help="audio device to speak through; MUST NOT be the Multi-Output device")
+    p.add_argument("--speak-rate", type=int, default=0, help="words per minute, e.g. 190")
+    p.add_argument("--speak-lag", type=float, default=12.0,
+                   help="drop speech older than this many seconds")
     args = p.parse_args()
 
     if not args.model:
-        args.model = os.environ.get("GROQ_MODEL") or (
+        # Deliberately NOT GROQ_MODEL: that name is already used by other tools on
+        # this machine and points at a reasoning model, which is both slow for live
+        # translation and prone to returning an empty message. Opting in takes a
+        # name of our own.
+        args.model = os.environ.get("MT_GROQ_MODEL") or (
             REASONING_MODEL if args.reasoning else FAST_MODEL
         )
 
@@ -341,8 +448,26 @@ def main() -> int:
     if not args.no_window:
         open_window(url)
 
+    speech: "queue.Queue | None" = None
+    if args.speak:
+        if not args.voice:
+            args.voice = resolve_voice(args.target) or ""
+        if not args.voice:
+            print(f"error: no macOS voice found for {args.target}. Pass --voice NAME "
+                  f"(see: say -v '?'). Speaking it with the wrong voice would be gibberish.",
+                  file=sys.stderr)
+            return 2
+        if not args.speak_device:
+            print(">> warning: no --speak-device. If system output is the Multi-Output "
+                  "device, spoken translations will be captured and translated again.",
+                  file=sys.stderr)
+        where = f" via '{args.speak_device}'" if args.speak_device else ""
+        print(f">> speaking:     {args.voice}{where}", file=sys.stderr)
+        speech = queue.Queue()
+        threading.Thread(target=speak_worker, args=(speech, args), daemon=True).start()
+
     jobs: queue.Queue = queue.Queue()
-    threading.Thread(target=worker, args=(jobs, args, key, log_path), daemon=True).start()
+    threading.Thread(target=worker, args=(jobs, args, key, log_path, speech), daemon=True).start()
 
     idx = 0
     seen: deque = deque(maxlen=40)

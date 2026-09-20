@@ -2,6 +2,7 @@
 # Live meeting translator: hear the meeting, read it in your language.
 #
 #   meeting.sh start [target-language]     # e.g. meeting.sh start English
+#   meeting.sh start Indonesian --speak    # ...and say it out loud
 #   meeting.sh devices                     # list capture devices whisper-stream can see
 #
 # What it does: routes system output through a Multi-Output Device (your speakers
@@ -54,6 +55,8 @@ start) ;;
 esac
 
 TARGET="${2:-English}"
+shift $(( $# > 2 ? 2 : $# ))
+EXTRA=("$@")   # anything else goes straight to translator.py, e.g. --speak
 
 # --- preflight ---------------------------------------------------------------
 command -v whisper-stream    >/dev/null || die "whisper-stream missing (brew install whisper-cpp)"
@@ -92,6 +95,11 @@ restore() {
 trap restore EXIT INT TERM
 
 SwitchAudioSource -s "$MO" >/dev/null 2>&1 || die "could not select '$MO'"
+
+# Spoken translations must go straight to the speakers, NOT through the
+# Multi-Output device -- that one feeds BlackHole, so our own voice would be
+# captured, transcribed, translated and spoken again, forever.
+export SPEAK_DEVICE="${SPEAK_DEVICE:-$PREV}"
 echo ">> output: '$MO'  (you will still hear the meeting)" >&2
 echo ">> capture: #$CAP '$BLACKHOLE_NAME'  ->  translating to $TARGET" >&2
 echo ">> open http://127.0.0.1:$PORT   —   Ctrl-C to stop" >&2
@@ -108,4 +116,4 @@ exec whisper-stream \
   -l "${SOURCE_LANG:-auto}" \
   -kc \
   2>/dev/null \
-  | python3 "$ROOT/src/translator.py" --target "$TARGET" --port "$PORT"
+  | python3 "$ROOT/src/translator.py" --target "$TARGET" --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"}

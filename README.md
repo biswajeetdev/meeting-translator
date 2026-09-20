@@ -45,9 +45,10 @@ notes are worthless and you stop reading them.
 ```bash
 export GROQ_API_KEY=gsk_...
 
-scripts/meeting.sh start English      # translate whatever is spoken into English
-scripts/meeting.sh start Indonesian   # or into anything else
-scripts/meeting.sh devices            # list capture devices whisper-stream sees
+scripts/meeting.sh start English              # translate whatever is spoken into English
+scripts/meeting.sh start Indonesian           # or into anything else
+scripts/meeting.sh start Indonesian --speak   # ...and say it out loud
+scripts/meeting.sh devices                    # list capture devices whisper-stream sees
 ```
 
 The teleprompter opens in its own frameless window. Ctrl-C stops everything and
@@ -88,12 +89,44 @@ wrong order is worse than a slow one.
 terminal. Leaving a Mac's output pointed at a loopback device means the next call
 you take is silent and you do not know why.
 
+## Speaking it aloud
+
+`--speak` reads each translation out through macOS `say`, which ships usable
+voices for ~40 languages offline and free. The voice is chosen from the target
+language — Indonesian gets Damayanti, Japanese gets Kyoko — and a language with
+no installed voice is an error, never a substitution, because Indonesian text
+read by an English voice is confident nonsense.
+
+| Flag | Effect |
+|---|---|
+| `--speak` | speak translations aloud |
+| `--voice NAME` | override the chosen voice (`say -v '?'` lists them) |
+| `--speak-rate 190` | words per minute |
+| `--speak-lag 12` | drop speech older than this, in seconds |
+
+Two things this has to get right:
+
+**It must not hear itself.** System output goes to a Multi-Output Device that
+feeds BlackHole, so speaking through it would put the translation back into the
+transcriber and loop forever. This is not theoretical: whisper transcribes `say`'s
+Indonesian back verbatim at p=0.998. Spoken audio is therefore sent straight to
+the speakers with `say -a`, bypassing the loopback entirely. `meeting.sh` sets
+this from whatever your output device was before it started.
+
+**It must stay current.** Synthesis runs in real time, so a busy meeting queues
+faster than it can be spoken. An interpreter ninety seconds behind is worse than
+one who misses a line, so anything older than `--speak-lag` is dropped rather
+than played late.
+
+Wear headphones. Otherwise the spoken translation and the original voice
+compete, and your microphone picks up both.
+
 ## Roadmap
 
-- Spoken output: text-to-speech of the translation, for listening rather than reading
 - Re-processing the saved audio afterwards into a cleaner transcript than live
   decoding can produce
 - Speaker labels (`whisper-stream` has `--tinydiarize`)
+- Ducking the meeting's own volume while a translation is being spoken
 
 ## License
 
