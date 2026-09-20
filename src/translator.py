@@ -43,12 +43,21 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 FAST_MODEL = "qwen/qwen3.8-27b"          # ~0.4s, strong multilingual
 REASONING_MODEL = "openai/gpt-oss-120b"  # slower, better on implication
 
-# whisper-stream decorates its live output with ANSI erase-line codes and prints
-# bracketed non-speech guesses ([BLANK_AUDIO], *sighs*) that must never reach a
-# teleprompter as if someone had said them.
+# whisper-stream speaks two different dialects and we have to read both.
+#
+# Sliding-window mode (--step N) redraws one line using ANSI erase codes.
+# VAD mode (--step 0) emits blocks instead:
+#
+#     ### Transcription 4 START | t0 = 0 ms | t1 = 5648 ms
+#     [00:00:00.000 --> 00:00:29.980]   Buenos días a todos.
+#     ### Transcription 4 END
+#
+# so the timestamp prefix has to come off or it gets translated as if spoken.
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\[2K")
+STAMP = re.compile(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*")
 NOISE = re.compile(r"^\s*[\[(*].*[\])*]\s*$")
-SKIP_PREFIXES = ("init:", "main:", "whisper_", "ggml_", "load_backend", "[Start speaking]")
+SKIP_PREFIXES = ("init:", "main:", "whisper_", "ggml_", "load_backend",
+                 "[Start speaking]", "###")
 
 SYSTEM = """You are interpreting a live meeting into {target}.
 
@@ -81,11 +90,35 @@ LOCK = threading.Lock()
 
 
 def clean(line: str) -> str:
-    """Strip whisper-stream's terminal decoration; return '' for non-speech."""
+    """Strip whisper-stream's decoration; return '' for anything not speech."""
     line = ANSI.sub(" ", line).strip()
-    if not line or line.startswith(SKIP_PREFIXES) or NOISE.match(line):
+    if not line or line.startswith(SKIP_PREFIXES):
+        return ""
+    line = STAMP.sub("", line).strip()
+    if not line or NOISE.match(line):
         return ""
     return line
+
+
+def is_repeat(text: str, seen: deque) -> bool:
+    """True if this line is something we have already sent to the translator.
+
+    In VAD mode whisper-stream re-transcribes a growing buffer, so the same
+    sentence arrives again every couple of seconds until the pause that flushes
+    it. Without this, one sentence is translated -- and billed, and shown -- four
+    times over. Silence also produces a stuck hallucination ("Thank you.",
+    "*sighs*") that repeats until someone speaks; the same check absorbs it.
+
+    Exact repeats only. A growing buffer can also re-emit the previous sentence
+    with more words appended, but suppressing those would drop the tail of what
+    someone actually said, and that behaviour has not been characterised against
+    real speech yet -- so the fuller line is allowed through rather than guessed at.
+    """
+    norm = " ".join(text.lower().split())
+    if norm in seen:
+        return True
+    seen.append(norm)
+    return False
 
 
 def parse_reply(raw: str, fallback: str) -> "tuple[str, str | None]":
@@ -312,9 +345,10 @@ def main() -> int:
     threading.Thread(target=worker, args=(jobs, args, key, log_path), daemon=True).start()
 
     idx = 0
+    seen: deque = deque(maxlen=40)
     for raw in sys.stdin:
         text = clean(raw)
-        if text:
+        if text and not is_repeat(text, seen):
             idx += 1
             jobs.put((idx, text))
 
