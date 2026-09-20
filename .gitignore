@@ -1,0 +1,6 @@
+.state/
+transcripts/
+*.wav
+*.aiff
+.env
+__pycache__/
