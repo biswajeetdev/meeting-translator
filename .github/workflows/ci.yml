@@ -1,0 +1,38 @@
+name: CI
+
+# Runs only what a GitHub-hosted runner can actually do. whisper.cpp, BlackHole,
+# a Multi-Output audio device, macOS `say` and a Groq key are all unavailable
+# here, so the audio path, the TTS path and the translation call are out of scope
+# for this workflow and are not exercised.
+#
+# What IS covered is the layer where every bug so far has lived: parsing
+# whisper-stream's output, deciding which words are safe to commit, and reading
+# the model's reply. That is pure Python with no dependencies.
+"on":
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        # The tool itself is stdlib-only by design; pytest is the sole addition.
+        run: pip install pytest
+
+      - name: Syntax check every script
+        run: |
+          python -m compileall -q src/
+          bash -n scripts/meeting.sh
+
+      - name: Unit tests
+        run: python -m pytest -q tests/

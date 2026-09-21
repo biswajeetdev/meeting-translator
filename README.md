@@ -132,6 +132,22 @@ than played late.
 Wear headphones. Otherwise the spoken translation and the original voice
 compete, and your microphone picks up both.
 
+## Tests
+
+```bash
+pip install pytest && python -m pytest -q tests/
+```
+
+They cover the stream-parsing layer — reading whisper-stream's output, deciding
+which words are safe to commit, and parsing the model's reply. That is where both
+real bugs lived, and both were silent: a timestamp prefix being translated as
+though someone had said it, and a growing VAD buffer getting its opening
+translated three times over. No audio, no network, no API key.
+
+CI runs the same checks on 3.10 and 3.12. The audio path, TTS and the translation
+call need hardware and a key, so they are out of scope there and are exercised by
+running a real meeting.
+
 ## Roadmap
 
 - Re-processing the saved audio afterwards into a cleaner transcript than live
